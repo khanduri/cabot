@@ -11,8 +11,11 @@ from celery.utils.log import get_task_logger
 from django.conf import settings
 from django.contrib.auth.models import User
 from django.db import models
+from django.db.models.signals import post_save
 from django.utils import timezone
-from polymorphic import PolymorphicModel
+
+
+from polymorphic.models import PolymorphicModel
 
 from .alert import (
     send_alert,
@@ -133,9 +136,13 @@ class CheckGroupMixin(models.Model):
     hackpad_id = models.TextField(
         null=True,
         blank=True,
-        verbose_name='Recovery instructions',
+        verbose_name='Embedded recovery instructions',
         help_text='Gist, Hackpad or Refheap js embed with recovery instructions e.g. '
                   'https://you.hackpad.com/some_document.js'
+    )
+    runbook_link = models.TextField(
+        blank=True,
+        help_text='Link to the service runbook on your wiki.'
     )
 
     def __unicode__(self):
@@ -171,7 +178,9 @@ class CheckGroupMixin(models.Model):
                     timezone.now() - timedelta(minutes=settings.NOTIFICATION_INTERVAL)) < self.last_alert_sent:
                     return
             elif self.overall_status in (self.CRITICAL_STATUS, self.ERROR_STATUS):
-                if self.last_alert_sent and (
+                more_important = self.old_overall_status == self.WARNING_STATUS or \
+                    (self.old_overall_status == self.ERROR_STATUS and self.overall_status == self.CRITICAL_STATUS)
+                if not more_important and self.last_alert_sent and (
                     timezone.now() - timedelta(minutes=settings.ALERT_INTERVAL)) < self.last_alert_sent:
                     return
             self.last_alert_sent = timezone.now()
@@ -217,7 +226,7 @@ class CheckGroupMixin(models.Model):
     @property
     def recent_snapshots(self):
         snapshots = self.snapshots.filter(
-            time__gt=(timezone.now() - timedelta(minutes=60 * 24)))
+            time__gt=(timezone.now() - timedelta(minutes=60 * 24))).order_by("time")
         snapshots = list(snapshots.values())
         for s in snapshots:
             s['time'] = time.mktime(s['time'].timetuple())
@@ -485,11 +494,11 @@ class StatusCheck(PolymorphicModel):
     def recent_results(self):
         # Not great to use id but we are getting lockups, possibly because of something to do with index
         # on time_complete
-        return StatusCheckResult.objects.filter(check=self).order_by('-id').defer('raw_data')[:10]
+        return StatusCheckResult.objects.filter(status_check=self).order_by('-id').defer('raw_data')[:10]
 
     def last_result(self):
         try:
-            return StatusCheckResult.objects.filter(check=self).order_by('-id').defer('raw_data')[0]
+            return StatusCheckResult.objects.filter(status_check=self).order_by('-id').defer('raw_data')[0]
         except:
             return None
 
@@ -498,11 +507,11 @@ class StatusCheck(PolymorphicModel):
         try:
             result = self._run()
         except SoftTimeLimitExceeded as e:
-            result = StatusCheckResult(check=self)
+            result = StatusCheckResult(status_check=self)
             result.error = u'Error in performing check: Celery soft time limit exceeded'
             result.succeeded = False
         except Exception as e:
-            result = StatusCheckResult(check=self)
+            result = StatusCheckResult(status_check=self)
             logger.error(u"Error performing check: %s" % (e.message,))
             result.error = u'Error in performing check: %s' % (e.message,)
             result.succeeded = False
@@ -570,7 +579,7 @@ class ICMPStatusCheck(StatusCheck):
         return "ICMP/Ping Check"
 
     def _run(self):
-        result = StatusCheckResult(check=self)
+        result = StatusCheckResult(status_check=self)
         instances = self.instance_set.all()
         target = self.instance_set.get().address
 
@@ -612,6 +621,7 @@ def minimize_targets(targets):
 
 
 class GraphiteStatusCheck(StatusCheck):
+
     class Meta(StatusCheck.Meta):
         proxy = True
 
@@ -634,10 +644,20 @@ class GraphiteStatusCheck(StatusCheck):
             return "%s %s %0.1f" % (value, self.check_type, float(self.value))
 
     def _run(self):
-        result = StatusCheckResult(check=self)
+        if not hasattr(self, 'utcnow'):
+            self.utcnow = None
+        result = StatusCheckResult(status_check=self)
 
         failures = []
-        graphite_output = parse_metric(self.metric, mins_to_check=self.frequency)
+
+        last_result = self.last_result()
+        if last_result:
+            last_result_started = last_result.time
+            time_to_check = max(self.frequency, ((timezone.now() - last_result_started).total_seconds() / 60) + 1)
+        else:
+            time_to_check = self.frequency
+
+        graphite_output = parse_metric(self.metric, mins_to_check=time_to_check, utcnow=self.utcnow)
 
         try:
             result.raw_data = json.dumps(graphite_output['raw'])
@@ -707,7 +727,7 @@ class HttpStatusCheck(StatusCheck):
         return "HTTP check"
 
     def _run(self):
-        result = StatusCheckResult(check=self)
+        result = StatusCheckResult(status_check=self)
 
         auth = None
         if self.username or self.password:
@@ -757,7 +777,7 @@ class JenkinsStatusCheck(StatusCheck):
         return 'Job failing on Jenkins'
 
     def _run(self):
-        result = StatusCheckResult(check=self)
+        result = StatusCheckResult(status_check=self)
         try:
             status = get_job_status(self.name)
             active = status['active']
@@ -811,7 +831,7 @@ class StatusCheckResult(models.Model):
     Checks don't have to use all the fields, so most should be
     nullable
     """
-    check = models.ForeignKey(StatusCheck)
+    status_check = models.ForeignKey(StatusCheck)
     time = models.DateTimeField(null=False, db_index=True)
     time_complete = models.DateTimeField(null=True, db_index=True)
     raw_data = models.TextField(null=True)
@@ -823,10 +843,13 @@ class StatusCheckResult(models.Model):
 
     class Meta:
         ordering = ['-time_complete']
-        index_together = (('check', 'time_complete'),)
+        index_together = (
+            ('status_check', 'time_complete'),
+            ('status_check', 'id'),  # used to speed up StatusCheck.last_result
+        )
 
     def __unicode__(self):
-        return '%s: %s @%s' % (self.status, self.check.name, self.time)
+        return '%s: %s @%s' % (self.status, self.status_check.name, self.time)
 
     @property
     def status(self):
@@ -862,11 +885,11 @@ class StatusCheckResult(models.Model):
 
 class AlertAcknowledgement(models.Model):
     time = models.DateTimeField()
-    user = models.ForeignKey(User)
+    user = models.ForeignKey(settings.AUTH_USER_MODEL)
     service = models.ForeignKey(Service)
     cancelled_time = models.DateTimeField(null=True, blank=True)
     cancelled_user = models.ForeignKey(
-        User,
+        settings.AUTH_USER_MODEL,
         null=True,
         blank=True,
         related_name='cancelleduser_set'
@@ -880,7 +903,7 @@ class AlertAcknowledgement(models.Model):
 
 
 class UserProfile(models.Model):
-    user = models.OneToOneField(User, related_name='profile')
+    user = models.OneToOneField(settings.AUTH_USER_MODEL, related_name='profile')
 
     def user_data(self):
         for user_data_subclass in AlertPluginUserData.__subclasses__():
@@ -905,12 +928,19 @@ class UserProfile(models.Model):
     hipchat_alias = models.CharField(max_length=50, blank=True, default='')
     fallback_alert_user = models.BooleanField(default=False)
 
+def create_user_profile(sender, instance, created, **kwargs):
+    if created:
+        UserProfile.objects.create(user=instance)
+
+post_save.connect(create_user_profile, sender=settings.AUTH_USER_MODEL)
+
 
 class Shift(models.Model):
     start = models.DateTimeField()
     end = models.DateTimeField()
-    user = models.ForeignKey(User)
+    user = models.ForeignKey(settings.AUTH_USER_MODEL)
     uid = models.TextField()
+    last_modified = models.DateTimeField()
     deleted = models.BooleanField(default=False)
 
     def __unicode__(self):
@@ -954,12 +984,13 @@ def update_shifts():
         e = event['summary'].lower().strip()
         if e in user_lookup:
             user = user_lookup[e]
-            try:
-                s = Shift.objects.get(uid=event['uid'])
-            except Shift.DoesNotExist:
-                s = Shift(uid=event['uid'])
-            s.start = event['start']
-            s.end = event['end']
-            s.user = user
-            s.deleted = False
-            s.save()
+            # Delete any events that have been updated in ical
+            Shift.objects.filter(uid=event['uid'],
+                last_modified__lt=event['last_modified']).delete()
+            Shift.objects.get_or_create(
+                uid=event['uid'],
+                start=event['start'],
+                end=event['end'],
+                last_modified=event['last_modified'],
+                user=user,
+                deleted=False)
