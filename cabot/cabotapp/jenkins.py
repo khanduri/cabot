@@ -1,35 +1,47 @@
+from __future__ import absolute_import
+
 from datetime import datetime
 
-import requests
+import jenkins
 from celery.utils.log import get_task_logger
 from django.conf import settings
 from django.utils import timezone
 
 logger = get_task_logger(__name__)
 
-auth = (settings.JENKINS_USER, settings.JENKINS_PASS)
 
+def _get_jenkins_client(jenkins_config):
+    return jenkins.Jenkins(jenkins_config.jenkins_api,
+                           username=jenkins_config.jenkins_user,
+                           password=jenkins_config.jenkins_pass)
 
-def get_job_status(jobname):
+def get_job_status(jenkins_config, jobname):
     ret = {
-        'active': True,
-        'succeeded': False,
+        'active': None,
+        'succeeded': None,
+        'job_number': None,
         'blocked_build_time': None,
-        'status_code': 200
     }
-    endpoint = settings.JENKINS_API + 'job/%s/api/json' % jobname
-    resp = requests.get(endpoint, auth=auth, verify=True)
-    status = resp.json()
-    ret['status_code'] = resp.status_code
-    ret['job_number'] = status['lastBuild'].get('number', None)
-    if status['color'].startswith('blue') or status['color'].startswith('green'): # Jenkins uses "blue" for successful; Hudson uses "green"
-        ret['active'] = True
-        ret['succeeded'] = True
-    elif status['color'] == 'disabled':
-        ret['active'] = False
-        ret['succeeded'] = False
-    if status['queueItem'] and status['queueItem']['blocked']:
-        time_blocked_since = datetime.utcfromtimestamp(
-            float(status['queueItem']['inQueueSince']) / 1000).replace(tzinfo=timezone.utc)
-        ret['blocked_build_time'] = (timezone.now() - time_blocked_since).total_seconds()
-    return ret
+    client = _get_jenkins_client(jenkins_config)
+    try:
+        job = client.get_job_info(jobname)
+        last_completed_build = job['lastCompletedBuild']
+        if not last_completed_build:
+            raise Exception("job has no build")
+        last_build = client.get_build_info(jobname, last_completed_build['number'])
+
+        ret['status_code'] = 200
+        ret['job_number'] = last_build['number']
+        ret['active'] = job['color'] != 'disabled'
+        ret['succeeded'] = ret['active'] and last_build['result'] == 'SUCCESS'
+
+        if job['inQueue']:
+            in_queued_since = job['queueItem']['inQueueSince']
+            time_blocked_since = datetime.utcfromtimestamp(
+                float(in_queued_since) / 1000).replace(tzinfo=timezone.utc)
+            ret['blocked_build_time'] = (timezone.now() - time_blocked_since).total_seconds()
+            ret['queued_job_number'] = job['lastBuild']['number']
+        return ret
+    except jenkins.NotFoundException:
+        ret['status_code'] = 404
+        return ret

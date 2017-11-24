@@ -6,6 +6,7 @@ import time
 from datetime import timedelta
 
 import requests
+
 from celery.exceptions import SoftTimeLimitExceeded
 from celery.utils.log import get_task_logger
 from django.conf import settings
@@ -13,19 +14,12 @@ from django.contrib.auth.models import User
 from django.db import models
 from django.db.models.signals import post_save
 from django.utils import timezone
-
-
 from polymorphic.models import PolymorphicModel
 
-from .alert import (
-    send_alert,
-    send_alert_update,
-    AlertPluginUserData
-)
-from .calendar import get_events
-from .graphite import parse_metric
-from .jenkins import get_job_status
-from .tasks import update_service, update_instance
+from ..alert import AlertPluginUserData, send_alert, send_alert_update
+from ..calendar import get_events
+from ..graphite import parse_metric
+from ..tasks import update_instance, update_service
 
 RAW_DATA_LIMIT = 5000
 
@@ -71,6 +65,31 @@ def calculate_debounced_passing(recent_results, debounce=0):
             return True
     return False
 
+def get_custom_check_plugins():
+    custom_check_types = []
+    check_subclasses = StatusCheck.__subclasses__()
+
+    # Checks that aren't using the plugin system
+    legacy_checks = [
+        "JenkinsStatusCheck",
+        "HttpStatusCheck",
+        "ICMPStatusCheck",
+        "GraphiteStatusCheck",
+    ]
+
+    for check in check_subclasses:
+        if check.__name__ in legacy_checks:
+            continue
+
+        check_name = check.check_name
+        custom_check = {}
+        custom_check['creation_url'] = "create-" + check_name + "-check"
+        custom_check['check_name'] = check_name
+        custom_check['icon_class'] = getattr(check, "icon_class", "glyphicon-ok")
+        custom_check['objects'] = check.objects
+        custom_check_types.append(custom_check)
+
+    return custom_check_types
 
 class CheckGroupMixin(models.Model):
     class Meta:
@@ -292,6 +311,12 @@ class Service(CheckGroupMixin):
     url = models.TextField(
         blank=True,
         help_text="URL of service."
+    )
+
+    is_public = models.BooleanField(
+        verbose_name='Is Public',
+        default=False,
+        help_text='The service will be shown in the public home'
     )
 
     class Meta:
@@ -583,18 +608,14 @@ class ICMPStatusCheck(StatusCheck):
         instances = self.instance_set.all()
         target = self.instance_set.get().address
 
-        # We need to read both STDOUT and STDERR because ping can write to both, depending on the kind of error.
-        # Thanks a lot, ping.
-        ping_process = subprocess.Popen("ping -c 1 " + target, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                                        shell=True)
-        response = ping_process.wait()
-
-        if response == 0:
+        args = ['ping', '-c', '1', target]
+        try:
+            # We redirect stderr to STDOUT because ping can write to both, depending on the kind of error.
+            subprocess.check_output(args, stderr=subprocess.STDOUT, shell=False)
             result.succeeded = True
-        else:
-            output = ping_process.stdout.read()
+        except subprocess.CalledProcessError as e:
             result.succeeded = False
-            result.error = output
+            result.error = e.output
 
         return result
 
@@ -726,6 +747,11 @@ class HttpStatusCheck(StatusCheck):
     def check_category(self):
         return "HTTP check"
 
+    @classmethod
+    def _check_content_pattern(self, text_match, content):
+        content = content if isinstance(content, unicode) else unicode(content, "UTF-8")
+        return re.search(text_match, content)
+
     def _run(self):
         result = StatusCheckResult(status_check=self)
 
@@ -753,7 +779,7 @@ class HttpStatusCheck(StatusCheck):
                 result.succeeded = False
                 result.raw_data = resp.content
             elif self.text_match:
-                if not re.search(self.text_match, resp.content):
+                if not self._check_content_pattern(self.text_match, resp.content):
                     result.error = u'Failed to find match regex /%s/ in response body' % self.text_match
                     result.raw_data = resp.content
                     result.succeeded = False
@@ -761,65 +787,6 @@ class HttpStatusCheck(StatusCheck):
                     result.succeeded = True
             else:
                 result.succeeded = True
-        return result
-
-
-class JenkinsStatusCheck(StatusCheck):
-    class Meta(StatusCheck.Meta):
-        proxy = True
-
-    @property
-    def check_category(self):
-        return "Jenkins check"
-
-    @property
-    def failing_short_status(self):
-        return 'Job failing on Jenkins'
-
-    def _run(self):
-        result = StatusCheckResult(status_check=self)
-        try:
-            status = get_job_status(self.name)
-            active = status['active']
-            result.job_number = status['job_number']
-            if status['status_code'] == 404:
-                result.error = u'Job %s not found on Jenkins' % self.name
-                result.succeeded = False
-                return result
-            elif status['status_code'] > 400:
-                # Will fall through to next block
-                raise Exception(u'returned %s' % status['status_code'])
-        except Exception as e:
-            # If something else goes wrong, we will *not* fail - otherwise
-            # a lot of services seem to fail all at once.
-            # Ugly to do it here but...
-            result.error = u'Error fetching from Jenkins - %s' % e.message
-            result.succeeded = True
-            return result
-
-        if not active:
-            # We will fail if the job has been disabled
-            result.error = u'Job "%s" disabled on Jenkins' % self.name
-            result.succeeded = False
-        else:
-            if self.max_queued_build_time and status['blocked_build_time']:
-                if status['blocked_build_time'] > self.max_queued_build_time * 60:
-                    result.succeeded = False
-                    result.error = u'Job "%s" has blocked build waiting for %ss (> %sm)' % (
-                        self.name,
-                        int(status['blocked_build_time']),
-                        self.max_queued_build_time,
-                    )
-                else:
-                    result.succeeded = status['succeeded']
-            else:
-                result.succeeded = status['succeeded']
-            if not status['succeeded']:
-                if result.error:
-                    result.error += u'; Job "%s" failing on Jenkins' % self.name
-                else:
-                    result.error = u'Job "%s" failing on Jenkins' % self.name
-                result.raw_data = status
         return result
 
 
@@ -881,7 +848,6 @@ class StatusCheckResult(models.Model):
         if isinstance(self.raw_data, basestring):
             self.raw_data = self.raw_data[:RAW_DATA_LIMIT]
         return super(StatusCheckResult, self).save(*args, **kwargs)
-
 
 class AlertAcknowledgement(models.Model):
     time = models.DateTimeField()

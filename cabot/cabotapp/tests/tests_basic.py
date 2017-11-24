@@ -10,9 +10,10 @@ import requests
 from cabot.cabotapp.graphite import parse_metric
 from cabot.cabotapp.alert import update_alert_plugins, AlertPlugin
 from cabot.cabotapp.models import (
-    GraphiteStatusCheck, JenkinsStatusCheck,
+    GraphiteStatusCheck, JenkinsStatusCheck, JenkinsConfig,
     HttpStatusCheck, ICMPStatusCheck, Service, Instance,
-    StatusCheckResult, minimize_targets, ServiceStatusSnapshot)
+    StatusCheckResult, minimize_targets, ServiceStatusSnapshot,
+    get_custom_check_plugins, create_default_jenkins_config)
 from cabot.cabotapp.calendar import get_events
 from cabot.cabotapp.views import StatusCheckReportForm
 from cabot.cabotapp import tasks
@@ -23,6 +24,7 @@ from django.core import mail
 from django.core.urlresolvers import reverse
 from django.test.client import Client
 from django.test.utils import override_settings
+from django.test import TestCase
 from django.utils import timezone
 from freezegun import freeze_time
 from mock import Mock, patch
@@ -75,11 +77,13 @@ class LocalTestCase(APITestCase):
             created_by=self.user,
             importance=Service.ERROR_STATUS,
         )
+        create_default_jenkins_config()
         self.jenkins_check = JenkinsStatusCheck.objects.create(
             name='Jenkins Check',
             created_by=self.user,
             importance=Service.ERROR_STATUS,
             max_queued_build_time=10,
+            jenkins_config = JenkinsConfig.objects.first()
         )
         self.http_check = HttpStatusCheck.objects.create(
             name='Http Check',
@@ -150,17 +154,23 @@ def fake_slow_graphite_response(*args, **kwargs):
 
 
 def fake_jenkins_response(*args, **kwargs):
-    resp = Mock()
-    resp.json = lambda: json.loads(get_content('jenkins_response.json'))
-    resp.status_code = 200
-    return resp
+    return {
+        'active': True,
+        'status_code': 200,
+        'blocked_build_time': None,
+        'succeeded': False,
+        'job_number': 176
+    }
 
 
 def jenkins_blocked_response(*args, **kwargs):
-    resp = Mock()
-    resp.json = lambda: json.loads(get_content('jenkins_blocked_response.json'))
-    resp.status_code = 200
-    return resp
+    return {
+        'active': True,
+        'status_code': 200,
+        'blocked_build_time': 108616352.65387,
+        'succeeded': False,
+        'job_number': 1999
+    }
 
 
 def fake_http_200_response(*args, **kwargs):
@@ -343,6 +353,19 @@ class TestCheckRun(LocalTestCase):
         result = checkresults.order_by('-time')[0]
         self.assertEqual(result.error, u'PROD: 9.16092 > 9.0')
 
+    @patch('cabot.cabotapp.graphite.requests.get')
+    def test_graphite_series_run_exception(self, fake_graphite_series_response):
+        fake_graphite_series_response.side_effect = requests.exceptions.RequestException("some error")
+        jsn = parse_metric('fake.pattern', utcnow=1387818601)
+        expected = {
+            'series': [],
+            'raw': 'Error getting data from Graphite: some error',
+            'num_series_with_data': 0,
+            'error': 'Error getting data from Graphite: some error',
+            'num_series_no_data': 0
+        }
+        self.assertEqual(jsn, expected)
+
     @patch('cabot.cabotapp.graphite.requests.get', fake_graphite_series_response)
     def test_graphite_series_run(self):
         jsn = parse_metric('fake.pattern', utcnow=1387818601)
@@ -379,8 +402,9 @@ class TestCheckRun(LocalTestCase):
         self.assertTrue(self.graphite_check.last_result().succeeded)
         self.assertGreater(list(checkresults)[-1].took, 0.0)
 
-    @patch('cabot.cabotapp.jenkins.requests.get', fake_jenkins_response)
-    def test_jenkins_run(self):
+    @patch('cabot.cabotapp.models.jenkins_check_plugin.get_job_status')
+    def test_jenkins_run(self, mock_get_job_status):
+        mock_get_job_status.return_value = fake_jenkins_response()
         checkresults = self.jenkins_check.statuscheckresult_set.all()
         self.assertEqual(len(checkresults), 0)
         self.jenkins_check.run()
@@ -388,8 +412,9 @@ class TestCheckRun(LocalTestCase):
         self.assertEqual(len(checkresults), 1)
         self.assertFalse(self.jenkins_check.last_result().succeeded)
 
-    @patch('cabot.cabotapp.jenkins.requests.get', jenkins_blocked_response)
-    def test_jenkins_blocked_build(self):
+    @patch('cabot.cabotapp.models.jenkins_check_plugin.get_job_status')
+    def test_jenkins_blocked_build(self, mock_get_job_status):
+        mock_get_job_status.return_value = jenkins_blocked_response()
         checkresults = self.jenkins_check.statuscheckresult_set.all()
         self.assertEqual(len(checkresults), 0)
         self.jenkins_check.run()
@@ -397,8 +422,9 @@ class TestCheckRun(LocalTestCase):
         self.assertEqual(len(checkresults), 1)
         self.assertFalse(self.jenkins_check.last_result().succeeded)
 
-    @patch('cabot.cabotapp.models.requests.get', throws_timeout)
+    @patch('cabot.cabotapp.models.jenkins_check_plugin.get_job_status', throws_timeout)
     def test_timeout_handling_in_jenkins(self):
+        """This works because we are effectively patching requests.get globally, including in jenkinsapi."""
         checkresults = self.jenkins_check.statuscheckresult_set.all()
         self.assertEqual(len(checkresults), 0)
         self.jenkins_check.run()
@@ -603,6 +629,32 @@ class TestWebInterface(LocalTestCase):
         self.assertEqual(response.status_code, 200)
         self.assertIn('Version:', response.content)
 
+    def test_public_page_empty(self):
+        response = self.client.get(reverse('public'))
+        self.assertEqual(response.status_code, 200)
+        self.assertIn('No available services monitoring', response.content)
+
+    def test_public_page_with_public_service(self):
+        Service.objects.create(
+            name='Public service without url',
+            is_public=True,
+        )
+        response = self.client.get(reverse('public'))
+        self.assertEqual(response.status_code, 200)
+        self.assertIn('Public service without url', response.content)
+
+    def test_public_page_with_public_service_with_url(self):
+        Service.objects.create(
+            name='Public service with url',
+            url='http://example.com/',
+            is_public=True,
+        )
+        response = self.client.get(reverse('public'))
+        self.assertEqual(response.status_code, 200)
+        expected = '<a href="http://example.com/" title="http://example.com/" target="_blank">Public service with url</a>'
+        self.assertIn(expected, response.content)
+
+
 class TestAPI(LocalTestCase):
     def setUp(self):
         super(TestAPI, self).setUp()
@@ -736,6 +788,7 @@ class TestAPI(LocalTestCase):
                     'max_queued_build_time': 10,
                     'id': self.jenkins_check.id,
                     'calculated_status': u'passing',
+                    'jenkins_config': JenkinsConfig.objects.first().id,
                 },
             ],
             'icmpstatuscheck': [
@@ -822,6 +875,7 @@ class TestAPI(LocalTestCase):
                     'max_queued_build_time': 37,
                     'id': self.jenkins_check.id,
                     'calculated_status': u'passing',
+                    'jenkins_config': JenkinsConfig.objects.first().id,
                 },
             ],
             'icmpstatuscheck': [
@@ -902,16 +956,19 @@ class TestAPIFiltering(LocalTestCase):
             name='Filter test 1',
             debounce=True,
             importance=Service.CRITICAL_STATUS,
+            jenkins_config=JenkinsConfig.objects.first()
         )
         JenkinsStatusCheck.objects.create(
             name='Filter test 2',
             debounce=True,
             importance=Service.WARNING_STATUS,
+            jenkins_config=JenkinsConfig.objects.first()
         )
         JenkinsStatusCheck.objects.create(
             name='Filter test 3',
             debounce=False,
             importance=Service.CRITICAL_STATUS,
+            jenkins_config=JenkinsConfig.objects.first()
         )
 
         GraphiteStatusCheck.objects.create(
@@ -1225,3 +1282,31 @@ class TestMinimizeTargets(LocalTestCase):
         result = minimize_targets(["prefix.prefix.a.suffix.suffix",
                                    "prefix.prefix.b.suffix.suffix",])
         self.assertEqual(result, ["a", "b"])
+
+
+class TestHttpStatusCheck(TestCase):
+
+    PATTERN_DATASET = [
+        {"pattern": u"буюЯзйЪ", "content": "буюЯзйЪ", "result": True},
+        {"pattern": u"юЯз", "content": "буюЯзйЪ", "result": True},
+        {"pattern": u"юЯз1", "content": "буюЯзйЪ", "result": False},
+        {"pattern": u"sti", "content": "testing", "result": True},
+        {"pattern": u"testing", "content": "testing", "result": True},
+        {"pattern": u"test", "content": "testing", "result": True},
+        {"pattern": u"test", "content": u"testing", "result": True},
+        {"pattern": u"ting", "content": "testing", "result": True},
+        {"pattern": u"日出處天子", "content": "日出處天子", "result": True},
+        {"pattern": u"出處", "content": "日出處天子", "result": True},
+        {"pattern": u"出處", "content": u"日出處天子", "result": True},
+        {"pattern": u"日出天子", "content": "日出處天子", "result": False},
+        {"pattern": u"юЯз", "content": "日出處天子", "result": False},
+        {"pattern": u"юЯз", "content": u"日出處天子", "result": False}
+    ]
+
+    def test_check_content_pattern(self):
+        for item in self.PATTERN_DATASET:
+            if HttpStatusCheck._check_content_pattern(item["pattern"], item["content"]):
+                self.assertTrue(item["result"])
+            else:
+                self.assertFalse(item["result"])
+

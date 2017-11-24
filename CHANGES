@@ -1,3 +1,73 @@
+master
+------
+
+* Fix issue where Jenkins environment variables were required on first launch
+
+Version 0.11.8
+--------------
+
+* Bump cabot-alert-slack to 0.8.2
+* Update LDAP dependencies
+* Add ENABLE_SUBSCRIPTION and ENABLE_DUTY_ROTA options
+* [[#556](https://github.com/arachnys/cabot/issues/556)] Fix issue with HttpStatusCheck with unicode content
+
+Version 0.11.7
+--------------
+
+* Fix check plugins not displaying checks correctly on service details page
+
+Version 0.11.6
+--------------
+
+* Add cloudwatch check plugin to dockerfile by default
+  - Can be enabled by adding "cabot_check_cloudwatch" to CABOT_PLUGINS_ENABLED
+
+Version 0.11.5
+--------------
+
+* Fix multiple jenkins configs not working properly
+  - Due to caching on the client, the first config to be checked would always be used
+
+Version 0.11.4
+--------------
+
+* Switch from jenkinsapi to python-jenkins
+  - Fixes performance regression introduced in 0.11
+
+Version 0.11.3
+--------------
+
+* [[#551](https://github.com/arachnys/cabot/issues/551)] Fix in-progress jenkins jobs being marked as failing
+
+Version 0.11.2
+--------------
+
+* Fix pypi source distribution missing requirements for setup.py
+
+Version 0.11.1
+--------------
+
+* Fix migration disassociating checks from services/instances
+* Fix migration requiring jenkins environment variables are set
+* Reduce time to store old check results to 7 days
+  - Currently stores for 2 months, but there's no actual way to view the old data.
+
+Version 0.11.0
+--------------
+
+*** BROKEN RELEASE - MIGRATIONS DON'T WORK CORRECTLY ***
+
+* Jenkins support:
+  - Fail Jenkins checks when job is unknown
+  - Use [jenkinsapi](https://pypi.python.org/pypi/jenkinsapi) to talk to Jenkins
+  - Add option to specify multiple Jenkins backends
+  > NOTE: This update will delete any recent status check results for jenkins checks
+* Add view for public services
+* Add support for Google OAuth login
+* Add ability to add custom check plugins
+  - See https://gitlab.com/as-public/cabot-check-skeleton for an example
+* Remove deprecated Fabfile and Shell scripts
+
 Version 0.10.8
 --------------
 
